@@ -1,6 +1,6 @@
 import 'dart:async';
-import 'dart:html' as html;
 import 'dart:collection';
+import 'dart:html' as html;
 import 'dart:js' as js;
 
 import 'package:flutter/services.dart';
@@ -42,7 +42,7 @@ class FlutterTtsPlugin {
   FlutterTtsPlugin() {
     try {
       utterance = html.SpeechSynthesisUtterance();
-      synth = html.window.speechSynthesis;
+      synth = html.window.speechSynthesis!;
       _listeners();
       supported = true;
     } catch (e) {
@@ -51,26 +51,11 @@ class FlutterTtsPlugin {
   }
 
   void _listeners() {
-    utterance["onstart"] = (e) {
+    utterance.onStart.listen((e) {
       ttsState = TtsState.playing;
       channel.invokeMethod("speak.onStart", null);
-      var bLocal = (utterance['voice']?["localService"] ?? false);
-      if (bLocal is bool && !bLocal) {
-        t = Timer.periodic(Duration(seconds: 14), (t) {
-          if (ttsState == TtsState.playing) {
-            synth.callMethod('pause');
-            synth.callMethod('resume');
-          } else {
-            t.cancel();
-          }
-        });
-      }
-    };
-    // js.JsFunction.withThis((e) {
-    //   ttsState = TtsState.playing;
-    //   channel.invokeMethod("speak.onStart", null);
-    // });
-    utterance["onend"] = (e) {
+    });
+    utterance.onEnd.listen((e) {
       ttsState = TtsState.stopped;
       if (_speechCompleter != null) {
         _speechCompleter?.complete();
@@ -78,26 +63,24 @@ class FlutterTtsPlugin {
       }
       t?.cancel();
       channel.invokeMethod("speak.onComplete", null);
-    };
-
-    utterance["onpause"] = (e) {
+    });
+    utterance.onPause.listen((e) {
       ttsState = TtsState.paused;
       channel.invokeMethod("speak.onPause", null);
-    };
-
-    utterance["onresume"] = (e) {
+    });
+    utterance.onResume.listen((e) {
       ttsState = TtsState.continued;
       channel.invokeMethod("speak.onContinue", null);
-    };
-
-    utterance["onerror"] = (e) {
+    });
+    utterance.onError.listen((e) {
+      ttsState = TtsState.stopped;
       if (_speechCompleter != null) {
-        _speechCompleter?.completeError(e as js.JsObject);
+        _speechCompleter?.completeError(e);
         _speechCompleter = null;
       }
       t?.cancel();
       channel.invokeMethod("speak.onError", e.toString());
-    };
+    });
   }
 
   Future<dynamic> handleMethodCall(MethodCall call) async {
@@ -159,38 +142,43 @@ class FlutterTtsPlugin {
 
   void _speak(String? text) {
     if (ttsState == TtsState.stopped || ttsState == TtsState.paused) {
-      utterance['text'] = text;
+      utterance.text = text;
       if (ttsState == TtsState.paused) {
-        synth.callMethod('resume');
+        synth.resume();
       } else {
-        synth.callMethod('speak', [utterance]);
+        synth.speak(utterance);
       }
     }
   }
 
   void _stop() {
     if (ttsState != TtsState.stopped) {
-      synth.callMethod('cancel');
+      synth.cancel();
     }
   }
 
   void _pause() {
     if (ttsState == TtsState.playing || ttsState == TtsState.continued) {
-      synth.callMethod('pause');
+      synth.pause();
     }
   }
 
-  void _setRate(num rate) => utterance['rate'] = rate;
-  void _setVolume(num? volume) => utterance['volume'] = volume;
-  void _setPitch(num? pitch) => utterance['pitch'] = pitch;
-  void _setLanguage(String? language) => utterance['lang'] = language;
+  void _setRate(num rate) => utterance.rate = rate * 1.5;
+
+  void _setVolume(num? volume) => utterance.volume = volume;
+
+  void _setPitch(num? pitch) => utterance.pitch = pitch;
+
+  void _setLanguage(String? language) => utterance.lang = language;
+
   void _setVoice(Map<String?, String?> voice) {
-    var tmpVoices = synth.callMethod("getVoices");
-    var targetList = tmpVoices.where((e) {
-      return voice["name"] == e["name"] && voice["locale"] == e["lang"];
+    var tmpVoices = js.context['speechSynthesis'].callMethod('getVoices')
+    as js.JsArray<dynamic>;
+    var targetList = tmpVoices.where((target) {
+      return voice["name"] == target.name && voice["locale"] == target.lang;
     });
-    if (targetList.isNotEmpty as bool) {
-      utterance['voice'] = targetList.first;
+    if (targetList.isNotEmpty) {
+      utterance.voice = targetList!.first;
     }
   }
 
@@ -210,16 +198,18 @@ class FlutterTtsPlugin {
   }
 
   void _setVoices() {
-    voices = synth.callMethod("getVoices") as List<dynamic>;
+    voices = js.context['speechSynthesis'].callMethod('getVoices')
+        as js.JsArray<dynamic>?;
   }
 
   getVoices() async {
-    var tmpVoices = synth.callMethod("getVoices");
+    var tmpVoices = js.context['speechSynthesis'].callMethod('getVoices')
+    as js.JsArray<dynamic>;
     var voiceList = <Map<String, String>>[];
     for (var voice in tmpVoices) {
       voiceList.add({
-        "name": voice["name"] as String,
-        "locale": voice["lang"] as String,
+        "name": voice.name as String,
+        "locale": voice.lang as String,
       });
     }
     return voiceList;
