@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:html' as html;
 import 'dart:collection';
 import 'dart:js' as js;
 
@@ -31,8 +32,8 @@ class FlutterTtsPlugin {
     channel.setMethodCallHandler(instance.handleMethodCall);
   }
 
-  late js.JsObject synth;
-  late js.JsObject utterance;
+  late html.SpeechSynthesis synth;
+  late html.SpeechSynthesisUtterance utterance;
   List<dynamic>? voices;
   List<String?>? languages;
   Timer? t;
@@ -40,10 +41,8 @@ class FlutterTtsPlugin {
 
   FlutterTtsPlugin() {
     try {
-      utterance = new js.JsObject(
-          js.context["SpeechSynthesisUtterance"] as js.JsFunction, [""]);
-      synth = new js.JsObject.fromBrowserObject(
-          js.context["speechSynthesis"] as js.JsObject);
+      utterance = html.SpeechSynthesisUtterance();
+      synth = html.window.speechSynthesis;
       _listeners();
       supported = true;
     } catch (e) {
@@ -171,10 +170,7 @@ class FlutterTtsPlugin {
 
   void _stop() {
     if (ttsState != TtsState.stopped) {
-      synth.callMethod('pause');
-      Future.delayed(Duration(milliseconds: 500), () {
-        synth.callMethod('cancel');
-      });
+      synth.callMethod('cancel');
     }
   }
 
