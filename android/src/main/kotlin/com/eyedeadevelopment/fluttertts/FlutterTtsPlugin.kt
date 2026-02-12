@@ -42,7 +42,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     private var awaitSynthCompletion = false
     private var synth = false
     private var context: Context? = null
-    private var tts: TextToSpeech? = null
+    @Volatile private var tts: TextToSpeech? = null
     private val tag = "TTS"
     private val pendingMethodCalls = ArrayList<Runnable>()
     private val utterances = HashMap<String, String>()
@@ -80,11 +80,27 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        stop()
-        tts!!.shutdown()
-        context = null
-        methodChannel!!.setMethodCallHandler(null)
+        methodChannel?.setMethodCallHandler(null)
         methodChannel = null
+        context = null
+        // Stop and shutdown TTS off the main thread to prevent ANR
+        // (TTS binder IPC can block if the service is busy)
+        val ttsRef = tts
+        tts = null
+        if (ttsRef != null) {
+            Thread {
+                try {
+                    ttsRef.stop()
+                } catch (e: Exception) {
+                    Log.w(tag, "TTS stop failed during detach: $e")
+                }
+                try {
+                    ttsRef.shutdown()
+                } catch (e: Exception) {
+                    Log.w(tag, "TTS shutdown failed during detach: $e")
+                }
+            }.start()
+        }
     }
 
     private val utteranceProgressListener: UtteranceProgressListener =
@@ -226,7 +242,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
             }
 
             if (status == TextToSpeech.SUCCESS) {
-                tts!!.setOnUtteranceProgressListener(utteranceProgressListener)
+                tts?.setOnUtteranceProgressListener(utteranceProgressListener)
                 // Initialize default language with timeout-based approach to prevent ANR
                 initializeDefaultLanguage()
                 engineResult!!.success(1)
@@ -248,7 +264,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
             }
 
             if (status == TextToSpeech.SUCCESS) {
-                tts!!.setOnUtteranceProgressListener(utteranceProgressListener)
+                tts?.setOnUtteranceProgressListener(utteranceProgressListener)
                 // Initialize default language with timeout-based approach to prevent ANR
                 initializeDefaultLanguage()
             } else {
@@ -444,11 +460,11 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     }
 
     private fun setSpeechRate(rate: Float) {
-        tts!!.setSpeechRate(rate)
+        tts?.setSpeechRate(rate)
     }
 
     private fun isLanguageAvailable(locale: Locale?): Boolean {
-        return tts!!.isLanguageAvailable(locale) >= TextToSpeech.LANG_AVAILABLE
+        return (tts?.isLanguageAvailable(locale) ?: -1) >= TextToSpeech.LANG_AVAILABLE
     }
 
     private fun initializeDefaultLanguage() {
@@ -473,7 +489,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     private fun trySetLanguage(locale: Locale): Boolean {
         return try {
             if (isLanguageAvailable(locale)) {
-                tts!!.language = locale
+                tts?.let { it.language = locale }
                 Log.d(tag, "Successfully set language to: $locale")
                 true
             } else false
@@ -494,7 +510,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
         val locale: Locale = Locale.forLanguageTag(language!!)
         if (isLanguageAvailable(locale)) {
             var voiceToCheck: Voice? = null
-            for (v in tts!!.voices) {
+            for (v in tts?.voices ?: emptySet()) {
                 if (v.locale == locale && !v.isNetworkConnectionRequired) {
                     voiceToCheck = v
                     break
@@ -518,7 +534,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     private fun setLanguage(language: String?, result: Result) {
         val locale: Locale = Locale.forLanguageTag(language!!)
         if (isLanguageAvailable(locale)) {
-            tts!!.language = locale
+            tts?.let { it.language = locale }
             result.success(1)
         } else {
             result.success(0)
@@ -526,11 +542,11 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     }
 
     private fun setVoice(voice: HashMap<String?, String>, result: Result) {
-        for (ttsVoice in tts!!.voices) {
+        for (ttsVoice in tts?.voices ?: emptySet()) {
             if (ttsVoice.name == voice["name"] && ttsVoice.locale
                     .toLanguageTag() == voice["locale"]
             ) {
-                tts!!.voice = ttsVoice
+                tts?.let { it.voice = ttsVoice }
                 result.success(1)
                 return
             }
@@ -542,7 +558,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     private fun clearVoice(result: Result) {
         // Set to null instead of defaultVoice to avoid ANR from IPC/deserialization
         // This resets to the TTS engine's default voice
-        tts!!.voice = null
+        tts?.let { it.voice = null }
         result.success(1)
     }
 
@@ -558,7 +574,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
 
     private fun setPitch(pitch: Float, result: Result) {
         if (pitch in (0.5f..2.0f)) {
-            tts!!.setPitch(pitch)
+            tts?.setPitch(pitch)
             result.success(1)
         } else {
             Log.d(tag, "Invalid pitch $pitch value - Range is from 0.5 to 2.0")
@@ -569,7 +585,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     private fun getVoices(result: Result) {
         val voices = ArrayList<HashMap<String, String>>()
         try {
-            for (voice in tts!!.voices) {
+            for (voice in tts?.voices ?: emptySet()) {
                 val voiceMap = HashMap<String, String>()
                 readVoiceProperties(voiceMap, voice)
                 voices.add(voiceMap)
@@ -587,7 +603,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 // While this method was introduced in API level 21, it seems that it
                 // has not been implemented in the speech service side until API Level 23.
-                for (locale in tts!!.availableLanguages) {
+                for (locale in tts?.availableLanguages ?: emptySet()) {
                     locales.add(locale.toLanguageTag())
                 }
             } else {
@@ -608,7 +624,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     private fun getEngines(result: Result) {
         val engines = ArrayList<String>()
         try {
-            for (engineInfo in tts!!.engines) {
+            for (engineInfo in tts?.engines ?: emptyList()) {
                 engines.add(engineInfo.name)
             }
         } catch (e: Exception) {
@@ -618,12 +634,12 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     }
 
     private fun getDefaultEngine(result: Result) {
-        val defaultEngine: String? = tts!!.defaultEngine
+        val defaultEngine: String? = tts?.defaultEngine
         result.success(defaultEngine)
     }
 
     private fun getDefaultVoice(result: Result) {
-        val defaultVoice: Voice? = tts!!.defaultVoice
+        val defaultVoice: Voice? = tts?.defaultVoice
         val voice = HashMap<String, String>()
         if (defaultVoice != null) {
             readVoiceProperties(voice, defaultVoice)
@@ -686,14 +702,14 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
             }
 
             if (silencems > 0) {
-                tts!!.playSilentUtterance(
+                tts?.playSilentUtterance(
                     silencems.toLong(),
                     TextToSpeech.QUEUE_FLUSH,
                     SILENCE_PREFIX + uuid
                 )
-                tts!!.speak(text, TextToSpeech.QUEUE_ADD, bundle, uuid) == 0
+                tts?.speak(text, TextToSpeech.QUEUE_ADD, bundle, uuid) == 0
             } else {
-                tts!!.speak(text, queueMode, bundle, uuid) == 0
+                tts?.speak(text, queueMode, bundle, uuid) == 0
             }
         } else {
             ttsStatus = null
@@ -705,7 +721,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     private fun stop() {
         if (awaitSynthCompletion) synth = false
         if (awaitSpeakCompletion) speaking = false
-        tts!!.stop()
+        tts?.stop()
     }
 
     private val maxSpeechInputLength: Int
@@ -729,12 +745,12 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
             SYNTHESIZE_TO_FILE_PREFIX + uuid
         )
 
-        val result: Int =
+        val result: Int? =
             if(isFullPath){
                 val file = File(fileName)
                 fullPath = file.path
 
-                tts!!.synthesizeToFile(text, bundle!!, file!!, SYNTHESIZE_TO_FILE_PREFIX + uuid)
+                tts?.synthesizeToFile(text, bundle!!, file!!, SYNTHESIZE_TO_FILE_PREFIX + uuid)
             } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 val resolver = this.context?.contentResolver
                 val contentValues = ContentValues().apply {
@@ -746,13 +762,13 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
                 this.parcelFileDescriptor = resolver?.openFileDescriptor(uri!!, "rw")
                 fullPath = uri?.path + File.separatorChar + fileName
 
-                tts!!.synthesizeToFile(text, bundle!!, parcelFileDescriptor!!, SYNTHESIZE_TO_FILE_PREFIX + uuid)
+                tts?.synthesizeToFile(text, bundle!!, parcelFileDescriptor!!, SYNTHESIZE_TO_FILE_PREFIX + uuid)
             } else {
                 val musicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
                 val file = File(musicDir, fileName)
                 fullPath = file.path
 
-                tts!!.synthesizeToFile(text, bundle!!, file!!, SYNTHESIZE_TO_FILE_PREFIX + uuid)
+                tts?.synthesizeToFile(text, bundle!!, file!!, SYNTHESIZE_TO_FILE_PREFIX + uuid)
             }
 
         if (result == TextToSpeech.SUCCESS) {
@@ -804,7 +820,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
                 .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                 .build()
-            tts!!.setAudioAttributes(audioAttributes)
+            tts?.setAudioAttributes(audioAttributes)
         }
     }
 
