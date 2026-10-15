@@ -43,6 +43,9 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     private var synth = false
     private var context: Context? = null
     @Volatile private var tts: TextToSpeech? = null
+    // Set once the engine detaches; a late onInit must then neither replay
+    // pending calls nor touch the released TextToSpeech
+    @Volatile private var detached = false
     private val tag = "TTS"
     private val pendingMethodCalls = ArrayList<Runnable>()
     private val utterances = HashMap<String, String>()
@@ -66,6 +69,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     }
 
     private fun initInstance(messenger: BinaryMessenger, context: Context) {
+        detached = false
         this.context = context
         methodChannel = MethodChannel(messenger, "flutter_tts")
         methodChannel!!.setMethodCallHandler(this)
@@ -80,20 +84,20 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        detached = true
         methodChannel?.setMethodCallHandler(null)
         methodChannel = null
         context = null
-        // Stop and shutdown TTS off the main thread to prevent ANR
-        // (TTS binder IPC can block if the service is busy)
+        synchronized(this@FlutterTtsPlugin) {
+            pendingMethodCalls.clear()
+        }
+        // Shut TTS down off the main thread to prevent ANR: shutdown() waits
+        // for the lock that a still running connection setup holds across its
+        // binder calls. shutdown() also stops speaking, so no stop() first.
         val ttsRef = tts
         tts = null
         if (ttsRef != null) {
             Thread {
-                try {
-                    ttsRef.stop()
-                } catch (e: Exception) {
-                    Log.w(tag, "TTS stop failed during detach: $e")
-                }
                 try {
                     ttsRef.shutdown()
                 } catch (e: Exception) {
@@ -232,6 +236,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
 
     private val onInitListenerWithCallback: TextToSpeech.OnInitListener =
         TextToSpeech.OnInitListener { status ->
+            if (detached) return@OnInitListener
             // Handle pending method calls (sent while TTS was initializing)
             synchronized(this@FlutterTtsPlugin) {
                 ttsStatus = status
@@ -254,6 +259,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
 
     private val onInitListenerWithoutCallback: TextToSpeech.OnInitListener =
         TextToSpeech.OnInitListener { status ->
+            if (detached) return@OnInitListener
             // Handle pending method calls (sent while TTS was initializing)
             synchronized(this@FlutterTtsPlugin) {
                 ttsStatus = status
