@@ -46,6 +46,12 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     // Set once the engine detaches; a late onInit must then neither replay
     // pending calls nor touch the released TextToSpeech
     @Volatile private var detached = false
+    // Instances this plugin replaced or released. shutdown() does nothing while
+    // an instance is still connecting (Android 12+), so they are shut down
+    // again whenever a late onInit shows that a connection came up after all
+    private val retiredTts = ArrayList<TextToSpeech>()
+    // speak calls already retried on a new TextToSpeech
+    private val reconnectedCalls = HashSet<Result>()
     private val tag = "TTS"
     private val pendingMethodCalls = ArrayList<Runnable>()
     private val utterances = HashMap<String, String>()
@@ -91,20 +97,37 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
         synchronized(this@FlutterTtsPlugin) {
             pendingMethodCalls.clear()
         }
-        // Shut TTS down off the main thread to prevent ANR: shutdown() waits
-        // for the lock that a still running connection setup holds across its
-        // binder calls. shutdown() also stops speaking, so no stop() first.
+        // shutdown() stops speaking without reporting onStop, so the focus
+        // taken by speak(focus: true) has to be given back here
+        releaseAudioFocus()
         val ttsRef = tts
         tts = null
-        if (ttsRef != null) {
-            Thread {
-                try {
-                    ttsRef.shutdown()
-                } catch (e: Exception) {
-                    Log.w(tag, "TTS shutdown failed during detach: $e")
-                }
-            }.start()
+        retire(ttsRef)
+    }
+
+    private fun retire(old: TextToSpeech?) {
+        if (old == null) return
+        synchronized(this@FlutterTtsPlugin) {
+            retiredTts.add(old)
         }
+        shutdownInBackground(old)
+    }
+
+    private fun shutdownRetired() {
+        val retired = synchronized(this@FlutterTtsPlugin) { ArrayList(retiredTts) }
+        for (old in retired) shutdownInBackground(old)
+    }
+
+    // Off the main thread to prevent ANR: shutdown() waits for the lock that a
+    // still running connection setup holds across its binder calls
+    private fun shutdownInBackground(old: TextToSpeech) {
+        Thread {
+            try {
+                old.shutdown()
+            } catch (e: Exception) {
+                Log.w(tag, "TTS shutdown failed: $e")
+            }
+        }.start()
     }
 
     private val utteranceProgressListener: UtteranceProgressListener =
@@ -236,15 +259,9 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
 
     private val onInitListenerWithCallback: TextToSpeech.OnInitListener =
         TextToSpeech.OnInitListener { status ->
+            shutdownRetired()
             if (detached) return@OnInitListener
-            // Handle pending method calls (sent while TTS was initializing)
-            synchronized(this@FlutterTtsPlugin) {
-                ttsStatus = status
-                for (call in pendingMethodCalls) {
-                    call.run()
-                }
-                pendingMethodCalls.clear()
-            }
+            replayPendingMethodCalls(status)
 
             if (status == TextToSpeech.SUCCESS) {
                 tts?.setOnUtteranceProgressListener(utteranceProgressListener)
@@ -259,15 +276,9 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
 
     private val onInitListenerWithoutCallback: TextToSpeech.OnInitListener =
         TextToSpeech.OnInitListener { status ->
+            shutdownRetired()
             if (detached) return@OnInitListener
-            // Handle pending method calls (sent while TTS was initializing)
-            synchronized(this@FlutterTtsPlugin) {
-                ttsStatus = status
-                for (call in pendingMethodCalls) {
-                    call.run()
-                }
-                pendingMethodCalls.clear()
-            }
+            replayPendingMethodCalls(status)
 
             if (status == TextToSpeech.SUCCESS) {
                 tts?.setOnUtteranceProgressListener(utteranceProgressListener)
@@ -277,6 +288,19 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
                 Log.e(tag, "Failed to initialize TextToSpeech with status: $status")
             }
         }
+
+    // Handle pending method calls (sent while TTS was initializing). They run
+    // from a copy: a call that fails again queues itself anew.
+    private fun replayPendingMethodCalls(status: Int) {
+        synchronized(this@FlutterTtsPlugin) {
+            ttsStatus = status
+            val calls = ArrayList(pendingMethodCalls)
+            pendingMethodCalls.clear()
+            for (call in calls) {
+                call.run()
+            }
+        }
+    }
 
     override fun onMethodCall(call: MethodCall, result: Result) {
         // If TTS is still loading
@@ -315,11 +339,31 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
                 }
                 val b = speak(text, focus)
                 if (!b) {
+                    if (focus) releaseAudioFocus()
                     synchronized(this@FlutterTtsPlugin) {
-                        val suspendedCall = Runnable { onMethodCall(call, result) }
-                        pendingMethodCalls.add(suspendedCall)
+                        // A ready engine that refuses has usually lost its
+                        // connection (its process died), and TextToSpeech
+                        // doesn't reconnect by itself: start a new one, once
+                        // per call, and retry when it is ready
+                        if (ttsStatus != null && reconnectedCalls.add(result)) {
+                            pendingMethodCalls.add(Runnable { onMethodCall(call, result) })
+                            ttsStatus = null
+                            retire(tts)
+                            tts = TextToSpeech(context, onInitListenerWithoutCallback, selectedEngine)
+                            return
+                        }
+                        // speak() has started a new TextToSpeech
+                        if (ttsStatus == null) {
+                            pendingMethodCalls.add(Runnable { onMethodCall(call, result) })
+                            return
+                        }
+                        reconnectedCalls.remove(result)
                     }
+                    result.success(0)
                     return
+                }
+                synchronized(this@FlutterTtsPlugin) {
+                    reconnectedCalls.remove(result)
                 }
                 // Only use await speak completion if queueMode is set to QUEUE_FLUSH
                 if (awaitSpeakCompletion && queueMode == TextToSpeech.QUEUE_FLUSH) {
@@ -516,7 +560,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
         val locale: Locale = Locale.forLanguageTag(language!!)
         if (isLanguageAvailable(locale)) {
             var voiceToCheck: Voice? = null
-            for (v in tts?.voices ?: emptySet()) {
+            for (v in tts?.voices ?: throw NullPointerException("voices unavailable")) {
                 if (v.locale == locale && !v.isNetworkConnectionRequired) {
                     voiceToCheck = v
                     break
@@ -534,6 +578,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
         ttsStatus = null
         selectedEngine = engine
         engineResult = result
+        retire(tts)
         tts = TextToSpeech(context, onInitListenerWithCallback, engine)
     }
 
@@ -548,7 +593,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     }
 
     private fun setVoice(voice: HashMap<String?, String>, result: Result) {
-        for (ttsVoice in tts?.voices ?: emptySet()) {
+        for (ttsVoice in tts?.voices ?: throw NullPointerException("voices unavailable")) {
             if (ttsVoice.name == voice["name"] && ttsVoice.locale
                     .toLanguageTag() == voice["locale"]
             ) {
@@ -591,7 +636,9 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     private fun getVoices(result: Result) {
         val voices = ArrayList<HashMap<String, String>>()
         try {
-            for (voice in tts?.voices ?: emptySet()) {
+            // null while the engine isn't bound: keep it null for Dart
+            val ttsVoices = tts?.voices ?: throw NullPointerException("voices unavailable")
+            for (voice in ttsVoices) {
                 val voiceMap = HashMap<String, String>()
                 readVoiceProperties(voiceMap, voice)
                 voices.add(voiceMap)
@@ -719,6 +766,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
             }
         } else {
             ttsStatus = null
+            retire(tts)
             tts = TextToSpeech(context, onInitListenerWithoutCallback, selectedEngine)
             false
         }
